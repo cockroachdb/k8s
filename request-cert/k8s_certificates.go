@@ -22,19 +22,35 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-
+	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	types "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
+	core "k8s.io/client-go/pkg/api/v1"
 	certificates "k8s.io/client-go/pkg/apis/certificates/v1beta1"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-var (
-	kubeConfig = flag.String("kubeconfig", "", "config file if running from outside the cluster")
+const (
+	watchTimeout = time.Hour
 )
 
-func kubernetesSigner(csrName string, csr []byte, wantServerAuth bool) ([]byte, error) {
+var (
+	kubeConfig  = flag.String("kubeconfig", "", "config file if running from outside the cluster")
+	namespace   = flag.String("namespace", "", "kubernetes namespace for this pod")
+	client      *kubernetes.Clientset
+	clientError error
+)
+
+func getClient() (*kubernetes.Clientset, error) {
+	if client == nil && clientError == nil {
+		client, clientError = initClient()
+	}
+	return client, clientError
+}
+
+func initClient() (*kubernetes.Clientset, error) {
 	// Create a config from the config file, or a InCluster config if empty.
 	config, err := clientcmd.BuildConfigFromFlags("", *kubeConfig)
 	if err != nil {
@@ -42,9 +58,18 @@ func kubernetesSigner(csrName string, csr []byte, wantServerAuth bool) ([]byte, 
 	}
 
 	// Create the client.
-	client, err := kubernetes.NewForConfig(config)
+	c, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return nil, errors.Wrap(err, "error creating kubernetes client")
+	}
+
+	return c, err
+}
+
+func getKubernetesCertificate(csrName string, csr []byte, wantServerAuth bool) ([]byte, error) {
+	client, err := getClient()
+	if err != nil {
+		return nil, err
 	}
 
 	keyUsages := []certificates.KeyUsage{
@@ -58,11 +83,9 @@ func kubernetesSigner(csrName string, csr []byte, wantServerAuth bool) ([]byte, 
 
 	// Build the certificate signing request.
 	req := &certificates.CertificateSigningRequest{
-		ObjectMeta: types.ObjectMeta{
-			Name: csrName,
-		},
+		TypeMeta:   types.TypeMeta{Kind: "CertificateSigningRequest"},
+		ObjectMeta: types.ObjectMeta{Name: csrName},
 		Spec: certificates.CertificateSigningRequestSpec{
-			Groups:  []string{"system:authenticated"},
 			Request: csr,
 			Usages:  keyUsages,
 		},
@@ -74,38 +97,100 @@ func kubernetesSigner(csrName string, csr []byte, wantServerAuth bool) ([]byte, 
 		return nil, errors.Wrapf(err, "CertificateSigningRequest.Create(%s) failed", req.Name)
 	}
 
-	fmt.Printf("Request sent. To approve, run 'kubectl certificate approve %s'\n", req.Name)
+	fmt.Printf("Request sent, waiting for approval. To approve, run 'kubectl certificate approve %s'\n", req.Name)
 
-	// TODO(mberhault): we may want a timeout here, perhaps also retries.
-	lastLog := time.Now()
+	// Build the watch request.
+	timeout := int64(watchTimeout.Seconds())
+	watchReq := types.ListOptions{
+		Watch:          true,
+		TimeoutSeconds: &timeout,
+		FieldSelector:  fields.OneTermEqualSelector("metadata.name", csrName).String(),
+	}
+
+	resultCh, err := client.Certificates().CertificateSigningRequests().Watch(watchReq)
+	if err != nil {
+		return nil, errors.Wrapf(err, "CertificateSigningRequest.Watch(%s) failed: %v", csrName)
+	}
+
+	watchCh := resultCh.ResultChan()
+	// Loop until we have a cert, CSR is denied, or we timed out. Bail out on errors.
 	for {
-		resp, err = client.Certificates().CertificateSigningRequests().Get(req.Name, types.GetOptions{})
-		if err != nil {
-			return nil, errors.Wrapf(err, "CertificateSigningRequest.Get(%s) failed", req.Name)
-		}
+		select {
+		case event, ok := <-watchCh:
+			if !ok {
+				break
+			}
 
-		// Empty conditions means pending.
-		if len(resp.Status.Conditions) != 0 {
-			break
-		}
+			if event.Object.(*certificates.CertificateSigningRequest).UID != resp.UID {
+				// Wrong object.
+				continue
+			}
 
-		if time.Since(lastLog) > time.Second*30 {
-			now := time.Now()
-			fmt.Printf("%s: waiting for 'kubectl certificate approve %s'\n", now, req.Name)
-			lastLog = now
-		}
+			status := event.Object.(*certificates.CertificateSigningRequest).Status
+			if len(status.Conditions) == 0 {
+				continue
+			}
 
-		time.Sleep(time.Second * 5)
+			// TODO(marc): do we need to examine other conditions? For now, we only have approve and deny,
+			// so the latest one should be fine.
+			cond := status.Conditions[len(status.Conditions)-1]
+			if cond.Type != certificates.CertificateApproved {
+				return nil, errors.Errorf("CSR not approved: %+v", status)
+			}
+
+			// This seems to happen: https://github.com/kubernetes/kubernetes/issues/47911
+			if status.Certificate == nil {
+				fmt.Printf("CSR approved, but no certificate in response. Waiting some more\n")
+				continue
+			}
+
+			fmt.Printf("request %s %s at %s\n", req.Name, cond.Type, cond.LastUpdateTime)
+			fmt.Printf("  reason:   %s\n", cond.Reason)
+			fmt.Printf("  message:  %s\n", cond.Message)
+			return status.Certificate, nil
+		case <-time.After(time.Second * 30):
+			// Print a "still waiting" message every 30s.
+			fmt.Printf("%s: waiting for 'kubectl certificate approve %s'\n", time.Now(), req.Name)
+			continue
+		}
 	}
 
-	status := resp.Status.Conditions[0]
-	fmt.Printf("request %s %s at %s\n", req.Name, status.Type, status.LastUpdateTime)
-	fmt.Printf("  reason:   %s\n", status.Reason)
-	fmt.Printf("  message:  %s\n", status.Message)
+	return nil, errors.New("watch channel closed")
+}
 
-	if status.Type != certificates.CertificateApproved {
-		return nil, errors.Errorf("certificate not approved: %+v", status)
+func storeSecrets(secretName string, cert []byte, key []byte) error {
+	client, err := getClient()
+	if err != nil {
+		return err
 	}
 
-	return resp.Status.Certificate, nil
+	secret := &core.Secret{
+		ObjectMeta: types.ObjectMeta{
+			Name: secretName,
+		},
+		Data: map[string][]byte{"cert": cert, "key": key},
+	}
+
+	_, err = client.Secrets(*namespace).Create(secret)
+	return err
+}
+
+// getSecrets attempts to lookup the certificate and key from the secrets store.
+// A valid response is nil error and non-nil certificate and key.
+func getSecrets(secretName string) ([]byte, []byte, error) {
+	client, err := getClient()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	secret, err := client.Core().Secrets(*namespace).Get(secretName, types.GetOptions{})
+	if err != nil {
+		if k8s_errors.IsNotFound(err) {
+			return nil, nil, nil
+		}
+		return nil, nil, err
+	}
+
+	// We let missing fields return nil.
+	return secret.Data["cert"], secret.Data["key"], nil
 }

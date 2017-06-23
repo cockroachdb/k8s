@@ -17,7 +17,6 @@
 package main
 
 import (
-	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -52,8 +51,13 @@ func main() {
 
 	// Check certificate type.
 	var template *x509.CertificateRequest
-	var filePrefix string
+	var filename, csrName string
 	var wantServerAuth bool
+
+	hostname, err := os.Hostname()
+	if err != nil || len(hostname) == 0 {
+		log.Fatalf("could not determine hostname. got: %q, err=%v", hostname, err)
+	}
 
 	switch *certificateType {
 	case "node":
@@ -61,44 +65,89 @@ func main() {
 			log.Fatal("node certificate requested, but --addresses is empty")
 		}
 		template = serverCSR(strings.Split(*addresses, ","))
-		filePrefix = "node"
+
+		// Certificate name for nodes must include a node identifier. We use the hostname.
+		// The CSR name is the same.
+		filename = "node"
+		csrName = filename + "." + hostname
 		wantServerAuth = true
 	case "client":
 		if len(*user) == 0 {
 			log.Fatal("client certificate requested, but --user is empty")
 		}
 		template = clientCSR(*user)
-		filePrefix = "client." + *user
+
+		// Certificate name for clients must only include the username.
+		// Include the hostname in the CSR name.
+		filename = "client." + *user
+		csrName = filename
 	default:
 		log.Fatalf("unknown certificate type requested: --type=%q. Valid types are \"node\", \"client\"", *certificateType)
 	}
 
+	log.Printf("Looking up cert and key under secret %s\n", csrName)
+	pemCert, pemKey, err := getSecrets(csrName)
+	if err != nil {
+		log.Fatalf("failed to read from secrets: %v", err)
+	}
+
+	if pemCert == nil || pemKey == nil {
+		log.Printf("Secret %s not found, sending CSR\n", csrName)
+		pemCert, pemKey, err = requestCertificate(csrName, template, wantServerAuth)
+		if err != nil {
+			log.Fatalf("failed to get certificate: %v", err)
+		}
+
+		log.Printf("Storing cert and key under secret %s\n", csrName)
+		if err := storeSecrets(csrName, pemCert, pemKey); err != nil {
+			log.Fatalf("could not store secrets: %v", err)
+		}
+	}
+
+	log.Print("Writing cert and key to local files\n")
+	if err := writeFiles(filename, pemCert, pemKey); err != nil {
+		log.Fatalf("failed to write files: %v", err)
+	}
+}
+
+// requestCertificate builds a CSR and send its for approval.
+// If approved, it will return the pem-encoded certificate and key, otherwise it returns an error.
+func requestCertificate(csrName string, template *x509.CertificateRequest, wantServerAuth bool) ([]byte, []byte, error) {
 	// Generate a new private key.
 	privateKey, err := rsa.GenerateKey(rand.Reader, *keySize)
 	if err != nil {
-		log.Fatalf("error generating RSA key pair: %v", err)
+		return nil, nil, errors.Wrap(err, "error generating RSA key pair")
 	}
 
-	// Generate CSR. The helper splits addresses into IP or DNS names.
-	pemCSR, err := templateToCSRBytes(template, privateKey)
+	// Convert key to PEM.
+	pemKey := pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "RSA PRIVATE KEY",
+			Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
+		},
+	)
+
+	// Create CSR.
+	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, template, privateKey)
 	if err != nil {
-		log.Fatalf("error generating CSR: %v", err)
+		return nil, nil, errors.Wrap(err, "error creating certificate request")
 	}
 
-	// Try to build a descriptive name for the CSR, that's all the admin sees.
-	csrName := filePrefix
-	if hostname, err := os.Hostname(); err == nil && len(hostname) != 0 {
-		csrName += "-" + hostname
-	}
+	// Convert CSR to PEM.
+	pemCSR := pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "CERTIFICATE REQUEST",
+			Bytes: csrBytes,
+		},
+	)
 
-	pemCert, err := kubernetesSigner(csrName, pemCSR, wantServerAuth)
+	// Send CSR for approval and certificate generation.
+	pemCert, err := getKubernetesCertificate(csrName, pemCSR, wantServerAuth)
 	if err != nil {
-		log.Fatalf("CSR signing failed: %v", err)
+		return nil, nil, err
 	}
 
-	if err := writeFiles(filePrefix, privateKey, pemCert); err != nil {
-		log.Fatalf("failed to write files: %v", err)
-	}
+	return pemCert, pemKey, nil
 }
 
 // serverCSR generates a certificate signing request for a server certificate and returns it.
@@ -135,23 +184,7 @@ func clientCSR(user string) *x509.CertificateRequest {
 	}
 }
 
-func templateToCSRBytes(template *x509.CertificateRequest, privateKey crypto.Signer) ([]byte, error) {
-	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, template, privateKey)
-	if err != nil {
-		return nil, err
-	}
-
-	pemData := pem.EncodeToMemory(
-		&pem.Block{
-			Type:  "CERTIFICATE REQUEST",
-			Bytes: csrBytes,
-		},
-	)
-
-	return pemData, nil
-}
-
-func writeFiles(filePrefix string, privateKey *rsa.PrivateKey, pemCert []byte) error {
+func writeFiles(filePrefix string, pemCert []byte, pemKey []byte) error {
 	// Make directory, but don't fail if it exists.
 	if err := os.MkdirAll(*certsDir, 0755); err != nil {
 		return errors.Wrapf(err, "could not create directory %s", *certsDir)
@@ -159,13 +192,7 @@ func writeFiles(filePrefix string, privateKey *rsa.PrivateKey, pemCert []byte) e
 
 	// Encode and write key.
 	keyPath := filepath.Join(*certsDir, filePrefix+".key")
-	keyContents := pem.EncodeToMemory(
-		&pem.Block{
-			Type:  "RSA PRIVATE KEY",
-			Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
-		},
-	)
-	if err := ioutil.WriteFile(keyPath, keyContents, 0400); err != nil {
+	if err := ioutil.WriteFile(keyPath, pemKey, 0400); err != nil {
 		return errors.Wrapf(err, "could not write private key file %s", keyPath)
 	}
 	fmt.Printf("wrote key file: %s\n", keyPath)
