@@ -38,7 +38,6 @@ const (
 
 var (
 	kubeConfig  = flag.String("kubeconfig", "", "config file if running from outside the cluster")
-	namespace   = flag.String("namespace", "", "kubernetes namespace for this pod")
 	client      *kubernetes.Clientset
 	clientError error
 )

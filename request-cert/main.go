@@ -40,6 +40,7 @@ var (
 	addresses = flag.String("addresses", "", "comma-separated list of DNS names and IP addresses for node certificate")
 	user      = flag.String("user", "", "username for client certificate")
 
+	namespace       = flag.String("namespace", "", "kubernetes namespace for this pod")
 	certsDir        = flag.String("certs-dir", "cockroach-certs", "certs directory")
 	keySize         = flag.Int("key-size", 2048, "RSA key size in bits")
 	symlinkCASource = flag.String("symlink-ca-from", "", "if non-empty, create <certs-dir>/ca.crt linking to this file")
@@ -48,6 +49,11 @@ var (
 func main() {
 	flag.Parse()
 	flag.Lookup("logtostderr").Value.Set("true")
+
+	// Validate flags.
+	if len(*namespace) == 0 {
+		log.Fatal("--namespace is required and must not be empty")
+	}
 
 	// Check certificate type.
 	var template *x509.CertificateRequest
@@ -69,7 +75,7 @@ func main() {
 		// Certificate name for nodes must include a node identifier. We use the hostname.
 		// The CSR name is the same.
 		filename = "node"
-		csrName = filename + "." + hostname
+		csrName = *namespace + "." + filename + "." + hostname
 		wantServerAuth = true
 	case "client":
 		if len(*user) == 0 {
@@ -80,7 +86,7 @@ func main() {
 		// Certificate name for clients must only include the username.
 		// Include the hostname in the CSR name.
 		filename = "client." + *user
-		csrName = filename
+		csrName = *namespace + "." + filename
 	default:
 		log.Fatalf("unknown certificate type requested: --type=%q. Valid types are \"node\", \"client\"", *certificateType)
 	}
