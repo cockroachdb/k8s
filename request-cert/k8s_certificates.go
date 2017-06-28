@@ -123,6 +123,7 @@ func getKubernetesCertificate(csrName string, csr []byte, wantServerAuth bool) (
 
 			if event.Object.(*certificates.CertificateSigningRequest).UID != resp.UID {
 				// Wrong object.
+				fmt.Printf("received watch notification for object %v, but expected UID=%s\n", event.Object, resp.UID)
 				continue
 			}
 
