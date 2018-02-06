@@ -22,12 +22,12 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	certificates "k8s.io/api/certificates/v1beta1"
+	core "k8s.io/api/core/v1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	types "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
-	core "k8s.io/client-go/pkg/api/v1"
-	certificates "k8s.io/client-go/pkg/apis/certificates/v1beta1"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	"k8s.io/client-go/tools/clientcmd"
 )
@@ -171,7 +171,7 @@ func storeSecrets(secretName string, cert []byte, key []byte) error {
 		Data: map[string][]byte{"cert": cert, "key": key},
 	}
 
-	_, err = client.Secrets(*namespace).Create(secret)
+	_, err = client.CoreV1().Secrets(*namespace).Create(secret)
 	return err
 }
 
