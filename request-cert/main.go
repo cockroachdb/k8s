@@ -118,7 +118,9 @@ func main() {
 
 // requestCertificate builds a CSR and send its for approval.
 // If approved, it will return the pem-encoded certificate and key, otherwise it returns an error.
-func requestCertificate(csrName string, template *x509.CertificateRequest, wantServerAuth bool) ([]byte, []byte, error) {
+func requestCertificate(
+	csrName string, template *x509.CertificateRequest, wantServerAuth bool,
+) ([]byte, []byte, error) {
 	// Generate a new private key.
 	privateKey, err := rsa.GenerateKey(rand.Reader, *keySize)
 	if err != nil {
@@ -211,8 +213,12 @@ func writeFiles(filePrefix string, pemCert []byte, pemKey []byte) error {
 	fmt.Printf("wrote certificate file: %s\n", certPath)
 
 	if len(*symlinkCASource) != 0 {
-		// Symlink CA certificate.
+		// Symlink CA certificate. First ensure there isn't already a file at the
+		// link destination because symlink is not idempotent.
 		linkDest := filepath.Join(*certsDir, "ca.crt")
+		if err := os.Remove(linkDest); err != nil && !os.IsNotExist(err) {
+			log.Printf("error removing previous ca.crt symlink: %v\n", err)
+		}
 		if err := os.Symlink(*symlinkCASource, linkDest); err != nil {
 			return errors.Wrapf(err, "could not create symlink %s -> %s", linkDest, *symlinkCASource)
 		}
