@@ -162,7 +162,7 @@ func getKubernetesCertificate(csrName string, csr []byte, wantServerAuth bool, a
 		}
 	}
 
-	return nil, errors.New("watch channel closed")
+	return nil, ChannelError
 }
 
 func storeSecrets(secretName string, cert []byte, key []byte) error {
