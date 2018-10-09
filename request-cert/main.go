@@ -150,7 +150,10 @@ func requestCertificate(
 	)
 
 	// Send CSR for approval and certificate generation.
-	pemCert, err := getKubernetesCertificate(csrName, pemCSR, wantServerAuth)
+	pemCert, err := getKubernetesCertificate(csrName, pemCSR, wantServerAuth, false)
+	for i := 0; i < 10 && err == ChannelError; i++ {
+		pemCert, err = getKubernetesCertificate(csrName, pemCSR, wantServerAuth, true)
+	}
 	if err != nil {
 		return nil, nil, err
 	}

@@ -37,9 +37,10 @@ const (
 )
 
 var (
-	kubeConfig  = flag.String("kubeconfig", "", "config file if running from outside the cluster")
-	client      *kubernetes.Clientset
-	clientError error
+	kubeConfig   = flag.String("kubeconfig", "", "config file if running from outside the cluster")
+	client       *kubernetes.Clientset
+	clientError  error
+	ChannelError = errors.New("error on the channel")
 )
 
 func getClient() (*kubernetes.Clientset, error) {
@@ -65,7 +66,7 @@ func initClient() (*kubernetes.Clientset, error) {
 	return c, err
 }
 
-func getKubernetesCertificate(csrName string, csr []byte, wantServerAuth bool) ([]byte, error) {
+func getKubernetesCertificate(csrName string, csr []byte, wantServerAuth bool, allowPrevious bool) ([]byte, error) {
 	client, err := getClient()
 	if err != nil {
 		return nil, err
@@ -92,6 +93,12 @@ func getKubernetesCertificate(csrName string, csr []byte, wantServerAuth bool) (
 
 	fmt.Printf("Sending create request: %s for %s\n", req.Name, *addresses)
 	resp, err := client.Certificates().CertificateSigningRequests().Create(req)
+
+	if err != nil && k8s_errors.IsAlreadyExists(err) && allowPrevious {
+		fmt.Printf("Attempting to use previous CSR: %s\n", req.Name)
+		getOpts := types.GetOptions{TypeMeta: types.TypeMeta{Kind: "CertificateSigningRequest"}}
+		resp, err = client.Certificates().CertificateSigningRequests().Get(req.Name, getOpts)
+	}
 	if err != nil {
 		return nil, errors.Wrapf(err, "CertificateSigningRequest.Create(%s) failed", req.Name)
 	}
@@ -117,7 +124,7 @@ func getKubernetesCertificate(csrName string, csr []byte, wantServerAuth bool) (
 		select {
 		case event, ok := <-watchCh:
 			if !ok {
-				break
+				return nil, ChannelError
 			}
 
 			if event.Object.(*certificates.CertificateSigningRequest).UID != resp.UID {
@@ -155,7 +162,7 @@ func getKubernetesCertificate(csrName string, csr []byte, wantServerAuth bool) (
 		}
 	}
 
-	return nil, errors.New("watch channel closed")
+	return nil, ChannelError
 }
 
 func storeSecrets(secretName string, cert []byte, key []byte) error {
