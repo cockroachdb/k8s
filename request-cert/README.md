@@ -33,4 +33,8 @@ $ docker build -t "cockroachdb/cockroach-k8s-request-cert:${NEW_TAG}" .
 
 # Push the docker image.
 docker push "cockroachdb/cockroach-k8s-request-cert:${NEW_TAG}"
+
+# Also update the "latest" tag.
+docker tag "cockroachdb/cockroach-k8s-request-cert:${NEW_TAG}" cockroachdb/cockroach-k8s-request-cert:latest
+docker push cockroachdb/cockroach-k8s-request-cert:latest
 ```
