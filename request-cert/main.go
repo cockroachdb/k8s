@@ -40,7 +40,7 @@ var (
 	addresses       = flag.String("addresses", "", "comma-separated list of DNS names and IP addresses for node certificate")
 	user            = flag.String("user", "", "username for client certificate")
 
-	cluster			= flag.String("cluster", "", "logical cluster name distinguishing it from other clusters in the same namespace")
+	cluster         = flag.String("cluster", "", "logical cluster name distinguishing it from other clusters in the same namespace")
 	namespace       = flag.String("namespace", "", "kubernetes namespace for this pod")
 	certsDir        = flag.String("certs-dir", "cockroach-certs", "certs directory")
 	keySize         = flag.Int("key-size", 4096, "RSA key size in bits")
