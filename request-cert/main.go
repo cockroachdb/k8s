@@ -21,6 +21,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -30,6 +31,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	pkcs12 "software.sslmate.com/src/go-pkcs12"
 
 	"github.com/pkg/errors"
 )
@@ -44,11 +47,15 @@ var (
 	certsDir        = flag.String("certs-dir", "cockroach-certs", "certs directory")
 	keySize         = flag.Int("key-size", 2048, "RSA key size in bits")
 	symlinkCASource = flag.String("symlink-ca-from", "", "if non-empty, create <certs-dir>/ca.crt linking to this file")
+	generatePKCS12  = flag.Bool("generate-pkcs12", false, "Generate PKCS#12 format key.")
+	pkcs12PassPrase = flag.String("pkcs12-passphrase", "", "Passprase for the PKCS#12 key.")
 )
 
 func main() {
 	flag.Parse()
-	flag.Lookup("logtostderr").Value.Set("true")
+	if flag.Lookup("logtostderr") != nil {
+		flag.Lookup("logtostderr").Value.Set("true")
+	}
 
 	// Validate flags.
 	if len(*namespace) == 0 {
@@ -63,6 +70,13 @@ func main() {
 	hostname, err := os.Hostname()
 	if err != nil || len(hostname) == 0 {
 		log.Fatalf("could not determine hostname. got: %q, err=%v", hostname, err)
+	}
+
+	passPhrase := *pkcs12PassPrase
+	if len(passPhrase) == 0 {
+		b := make([]byte, 10)
+		rand.Read(b)
+		passPhrase = base64.StdEncoding.EncodeToString(b)
 	}
 
 	switch *certificateType {
@@ -92,7 +106,7 @@ func main() {
 	}
 
 	log.Printf("Looking up cert and key under secret %s\n", csrName)
-	pemCert, pemKey, err := getSecrets(csrName)
+	pemCert, pemKey, pkcs12, err := getSecrets(csrName)
 	if err != nil {
 		log.Fatalf("failed to read from secrets: %v", err)
 	}
@@ -110,8 +124,19 @@ func main() {
 		}
 	}
 
+	if *generatePKCS12 && pkcs12 == nil {
+		pkcs12, err = genPKCS12(pemCert, pemKey, passPhrase)
+		if err != nil {
+			log.Fatalf("failed to generate PKCS#12 certificate: %v", err)
+		}
+
+		if err := storePkcs12Secrets(csrName, pkcs12, passPhrase); err != nil {
+			log.Fatalf("could not store PKCS#12 secrets: %v", err)
+		}
+	}
+
 	log.Print("Writing cert and key to local files\n")
-	if err := writeFiles(filename, pemCert, pemKey); err != nil {
+	if err := writeFiles(filename, pemCert, pemKey, pkcs12); err != nil {
 		log.Fatalf("failed to write files: %v", err)
 	}
 }
@@ -195,7 +220,7 @@ func clientCSR(user string) *x509.CertificateRequest {
 	}
 }
 
-func writeFiles(filePrefix string, pemCert []byte, pemKey []byte) error {
+func writeFiles(filePrefix string, pemCert []byte, pemKey []byte, pkcs12 []byte) error {
 	// Make directory, but don't fail if it exists.
 	if err := os.MkdirAll(*certsDir, 0755); err != nil {
 		return errors.Wrapf(err, "could not create directory %s", *certsDir)
@@ -215,6 +240,14 @@ func writeFiles(filePrefix string, pemCert []byte, pemKey []byte) error {
 	}
 	fmt.Printf("wrote certificate file: %s\n", certPath)
 
+	if *generatePKCS12 {
+		certPath := filepath.Join(*certsDir, filePrefix+".pfx")
+		if err := ioutil.WriteFile(certPath, pkcs12, 0644); err != nil {
+			return errors.Wrapf(err, "could not write certificate file %s", certPath)
+		}
+		fmt.Printf("wrote certificate file: %s\n", certPath)
+	}
+
 	if len(*symlinkCASource) != 0 {
 		// Symlink CA certificate. First ensure there isn't already a file at the
 		// link destination because symlink is not idempotent.
@@ -229,4 +262,19 @@ func writeFiles(filePrefix string, pemCert []byte, pemKey []byte) error {
 	}
 
 	return nil
+}
+
+func genPKCS12(pemCert, pemKey []byte, passPhrase string) ([]byte, error) {
+	block, _ := pem.Decode(pemKey)
+	pkey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+
+	block, _ = pem.Decode(pemCert)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	return pkcs12.Encode(rand.Reader, pkey, cert, nil, passPhrase)
 }
