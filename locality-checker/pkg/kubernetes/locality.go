@@ -22,6 +22,10 @@ type LocalityChecker struct {
 
 	// Whether to error if node does not have region and zone labels.
 	ErrorOnMissingLabels bool
+
+	// A prefix to add to locality values. Useful for prepending the cloud provider's
+	// name in front of the region and availability zone
+	Prefix string
 }
 
 type localityInfo struct {
@@ -60,8 +64,8 @@ func (l *LocalityChecker) getLocalityInfo(ctx context.Context) (*localityInfo, e
 		return nil, errors.Wrap(err, "no zone labels found")
 	}
 	return &localityInfo{
-		Region: region,
-		Zone:   zone,
+		Region: l.Prefix + region,
+		Zone:   l.Prefix + zone,
 	}, nil
 }
 
