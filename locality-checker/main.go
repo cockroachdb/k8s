@@ -18,12 +18,12 @@ func main() {
 
 	ctx := context.Background()
 
-	var localityMountPath string
-	if len(flag.Args()) == 2 {
-		localityMountPath = flag.Args()[1]
-	} else {
-		localityMountPath = defaultLocalityMountPath
+	localityMountPath := defaultLocalityMountPath
+	if flag.Arg(0) != "" {
+		localityMountPath = flag.Arg(0)
 	}
+
+	log.Printf("writing locality information to %s", localityMountPath)
 
 	nodeName := os.Getenv("KUBERNETES_NODE")
 	if nodeName == "" {
