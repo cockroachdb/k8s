@@ -11,19 +11,13 @@ import (
 
 const defaultLocalityMountPath = "/etc/cockroach-locality"
 
-var prefix = flag.String("prefix", "", "prefix")
+var prefix = flag.String("prefix", "", "string prepended to --locality and --az flags")
+var dest = flag.String("dest", defaultLocalityMountPath, "directory to which files are written")
 
 func main() {
 	flag.Parse()
 
 	ctx := context.Background()
-
-	var localityMountPath string
-	if len(flag.Args()) == 2 {
-		localityMountPath = flag.Args()[1]
-	} else {
-		localityMountPath = defaultLocalityMountPath
-	}
 
 	nodeName := os.Getenv("KUBERNETES_NODE")
 	if nodeName == "" {
@@ -37,7 +31,7 @@ func main() {
 	l := kubernetes.LocalityChecker{
 		Clientset:            clientset,
 		NodeName:             nodeName,
-		WritePath:            localityMountPath,
+		WritePath:            *dest,
 		ErrorOnMissingLabels: errorOnMissingLabels == "1",
 		Prefix:               *prefix,
 	}
