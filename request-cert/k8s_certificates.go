@@ -16,68 +16,61 @@
 
 package main
 
+//goland:noinspection SpellCheckingInspection
 import (
-	"flag"
+	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/pkg/errors"
 	certificates "k8s.io/api/certificates/v1beta1"
 	core "k8s.io/api/core/v1"
-	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	types "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-const (
-	watchTimeout = time.Hour
-)
-
-var (
-	kubeConfig   = flag.String("kubeconfig", "", "config file if running from outside the cluster")
-	client       *kubernetes.Clientset
-	clientError  error
-	ChannelError = errors.New("error on the channel")
-)
-
-func getClient() (*kubernetes.Clientset, error) {
-	if client == nil && clientError == nil {
-		client, clientError = initClient()
-	}
-	return client, clientError
+type KubernetesCertificateManager struct {
+	kubeConfig *string
+	client     *kubernetes.Clientset
+	logger     *log.Logger
 }
 
-func initClient() (*kubernetes.Clientset, error) {
-	// Create a config from the config file, or a InCluster config if empty.
+//NewKubernetesCertificateManager builds a new cert manager used to interface with Kubernetes.
+func NewKubernetesCertificateManager(logger *log.Logger, kubeConfig *string) (*KubernetesCertificateManager, error) {
+	kcm := &KubernetesCertificateManager{logger: logger}
+
+	var err error
 	config, err := clientcmd.BuildConfigFromFlags("", *kubeConfig)
 	if err != nil {
-		return nil, errors.Wrap(err, "error building kubernetes config")
+		kcm.logger.Printf("error building kubernetes config: %s", err)
+		return &KubernetesCertificateManager{}, err
 	}
 
-	// Create the client.
-	c, err := kubernetes.NewForConfig(config)
+	kcm.client, err = kubernetes.NewForConfig(config)
 	if err != nil {
-		return nil, errors.Wrap(err, "error creating kubernetes client")
+		kcm.logger.Printf("error building kubernetes client: %s", err)
+		return &KubernetesCertificateManager{}, err
 	}
 
-	return c, err
+	return kcm, nil
 }
 
-func getKubernetesCertificate(csrName string, csr []byte, wantServerAuth bool, allowPrevious bool) ([]byte, error) {
-	client, err := getClient()
-	if err != nil {
-		return nil, err
-	}
+// generateKubernetesCertificate will gen the CSR with the API in a way which can be auto-approved.
+// ref: https://kubernetes.io/docs/reference/access-authn-authz/certificate-signing-requests/#kubernetes-signers
+func (kcm *KubernetesCertificateManager) GetKubernetesCertificate(csrName string, csr []byte, wantServerAuth bool, allowPrevious bool) ([]byte, error) {
 
 	keyUsages := []certificates.KeyUsage{
 		certificates.UsageDigitalSignature,
 		certificates.UsageKeyEncipherment,
 		certificates.UsageClientAuth,
 	}
+
 	if wantServerAuth {
+		kcm.logger.Printf("%s is a server, using server auth", csrName)
 		keyUsages = append(keyUsages, certificates.UsageServerAuth)
 	}
 
@@ -88,88 +81,92 @@ func getKubernetesCertificate(csrName string, csr []byte, wantServerAuth bool, a
 		Spec: certificates.CertificateSigningRequestSpec{
 			Request: csr,
 			Usages:  keyUsages,
+			SignerName: func(wantServerAuth bool) *string {
+				if wantServerAuth {
+					signer := "kubernetes.io/legacy-unknown" // this is because the nodes need server + client.
+					kcm.logger.Printf("%s is a server, using %s as the signer", csrName, signer)
+					return &signer
+				} else {
+					signer := "kubernetes.io/kube-apiserver-client"
+					kcm.logger.Printf("%s is a client, using %s as the signer", csrName, signer)
+					return &signer
+				}
+			}(wantServerAuth),
 		},
 	}
 
-	fmt.Printf("Sending create request: %s for %s\n", req.Name, *addresses)
-	resp, err := client.Certificates().CertificateSigningRequests().Create(req)
+	kcm.logger.Printf("csr: %#v", req)
 
-	if err != nil && k8s_errors.IsAlreadyExists(err) && allowPrevious {
-		fmt.Printf("Attempting to use previous CSR: %s\n", req.Name)
-		getOpts := types.GetOptions{TypeMeta: types.TypeMeta{Kind: "CertificateSigningRequest"}}
-		resp, err = client.Certificates().CertificateSigningRequests().Get(req.Name, getOpts)
+	kcm.logger.Printf("sending create request: %s for %s\n", req.Name, *addresses)
+	resp, err := kcm.client.CertificatesV1beta1().CertificateSigningRequests().Create(context.Background(), req, types.CreateOptions{})
+
+	if err != nil && k8serrors.IsAlreadyExists(err) && allowPrevious {
+		kcm.logger.Printf("attempting to use previous CSR: %s\n", req.Name)
+		resp, err = kcm.client.CertificatesV1beta1().CertificateSigningRequests().Get(context.Background(), req.Name, types.GetOptions{
+			TypeMeta: types.TypeMeta{
+				Kind: "CertificateSigningRequest"},
+		})
 	}
 	if err != nil {
+		kcm.logger.Printf("CertificateSigningRequest.Create(%s) failed", req.Name)
 		return nil, errors.Wrapf(err, "CertificateSigningRequest.Create(%s) failed", req.Name)
 	}
 
-	fmt.Printf("Request sent, waiting for approval. To approve, run 'kubectl certificate approve %s'\n", req.Name)
+	kcm.logger.Printf("Request sent, waiting for approval. To approve, run 'kubectl certificate approve %s'", req.Name)
 
-	// Build the watch request.
-	timeout := int64(watchTimeout.Seconds())
-	watchReq := types.ListOptions{
-		Watch:          true,
-		TimeoutSeconds: &timeout,
-		FieldSelector:  fields.OneTermEqualSelector("metadata.name", csrName).String(),
-	}
+	ticker := time.NewTicker(time.Second * 1)
 
-	resultCh, err := client.Certificates().CertificateSigningRequests().Watch(watchReq)
-	if err != nil {
-		return nil, errors.Wrapf(err, "CertificateSigningRequest.Watch(%s) failed: %v", csrName)
-	}
+	cert := make([]byte, 0)
 
-	watchCh := resultCh.ResultChan()
-	// Loop until we have a cert, CSR is denied, or we timed out. Bail out on errors.
+Waiter:
 	for {
 		select {
-		case event, ok := <-watchCh:
-			if !ok {
-				return nil, ChannelError
+		case <-ticker.C:
+
+			getResp, err := kcm.client.CertificatesV1beta1().CertificateSigningRequests().Get(context.Background(), csrName, types.GetOptions{
+				TypeMeta: types.TypeMeta{Kind: "CertificateSigningRequest"},
+			})
+			if err != nil {
+				kcm.logger.Printf("error fetching %s from kubernetes api: %s", csrName, err)
+				return nil, errors.Errorf("error fetching %s from kubernetes api: %s", csrName, err)
 			}
 
-			if event.Object.(*certificates.CertificateSigningRequest).UID != resp.UID {
-				// Wrong object.
-				fmt.Printf("received watch notification for object %v, but expected UID=%s\n", event.Object, resp.UID)
+			if getResp.UID != resp.UID {
+				kcm.logger.Printf("got UID %v, but expected UID %s", getResp.UID, resp.UID)
+			}
+
+			// not ready, continue.
+			if len(getResp.Status.Conditions) == 0 {
+				kcm.logger.Printf("no conditions seen on %s, continuing", csrName)
 				continue
 			}
 
-			status := event.Object.(*certificates.CertificateSigningRequest).Status
-			if len(status.Conditions) == 0 {
-				continue
-			}
-
-			// TODO(marc): do we need to examine other conditions? For now, we only have approve and deny,
-			// so the latest one should be fine.
-			cond := status.Conditions[len(status.Conditions)-1]
+			cond := getResp.Status.Conditions[len(getResp.Status.Conditions)-1]
 			if cond.Type != certificates.CertificateApproved {
-				return nil, errors.Errorf("CSR not approved: %+v", status)
+				kcm.logger.Printf("csr not approved: %+v", resp.Status)
+				return nil, errors.Errorf("csr not approved: %+v", resp.Status)
 			}
 
-			// This seems to happen: https://github.com/kubernetes/kubernetes/issues/47911
-			if status.Certificate == nil {
-				fmt.Printf("CSR approved, but no certificate in response. Waiting some more\n")
+			if getResp.Status.Certificate == nil {
+				kcm.logger.Printf("csr approved, but no certificate in response. waiting some more")
 				continue
+			} else if getResp.Status.Certificate != nil {
+				kcm.logger.Printf("certificate is provisioned")
+				cert = getResp.Status.Certificate
+				break Waiter
 			}
 
-			fmt.Printf("request %s %s at %s\n", req.Name, cond.Type, cond.LastUpdateTime)
-			fmt.Printf("  reason:   %s\n", cond.Reason)
-			fmt.Printf("  message:  %s\n", cond.Message)
-			return status.Certificate, nil
-		case <-time.After(time.Second * 30):
-			// Print a "still waiting" message every 30s.
-			fmt.Printf("%s: waiting for 'kubectl certificate approve %s'\n", time.Now(), req.Name)
-			continue
+			kcm.logger.Printf("request: %s, reason: %s, message: %s",
+				fmt.Sprintf("request %s %s at %s", req.Name, cond.Type, cond.LastUpdateTime),
+				cond.Reason,
+				cond.Message)
 		}
 	}
 
-	return nil, ChannelError
+	return cert, nil
 }
 
-func storeSecrets(secretName string, cert []byte, key []byte) error {
-	client, err := getClient()
-	if err != nil {
-		return err
-	}
+func (kcm *KubernetesCertificateManager) StoreSecrets(secretName string, cert []byte, key []byte) error {
 
 	secret := &core.Secret{
 		ObjectMeta: types.ObjectMeta{
@@ -178,26 +175,36 @@ func storeSecrets(secretName string, cert []byte, key []byte) error {
 		Data: map[string][]byte{"cert": cert, "key": key},
 	}
 
-	_, err = client.CoreV1().Secrets(*namespace).Create(secret)
+	_, err := kcm.client.CoreV1().Secrets(*namespace).Create(context.Background(), secret, types.CreateOptions{})
+	if err != nil {
+		kcm.logger.Printf("error creating secret %s: %s", secretName, err)
+	}
 	return err
 }
 
-// getSecrets attempts to lookup the certificate and key from the secrets store.
+// GetSecrets attempts to lookup the certificate and key from the secrets store.
 // A valid response is nil error and non-nil certificate and key.
-func getSecrets(secretName string) ([]byte, []byte, error) {
-	client, err := getClient()
-	if err != nil {
-		return nil, nil, err
-	}
+func (kcm *KubernetesCertificateManager) GetSecrets(secretName string) ([]byte, []byte, error) {
 
-	secret, err := client.Core().Secrets(*namespace).Get(secretName, types.GetOptions{})
+	secret, err := kcm.client.CoreV1().Secrets(*namespace).Get(context.Background(), secretName, types.GetOptions{})
 	if err != nil {
-		if k8s_errors.IsNotFound(err) {
+		if k8serrors.IsNotFound(err) {
+			kcm.logger.Printf("secret %s not found", secretName)
 			return nil, nil, nil
 		}
+		kcm.logger.Printf("error finding secret %s: %s", secretName, err)
 		return nil, nil, err
 	}
 
-	// We let missing fields return nil.
+	if secret.Data["cert"] == nil {
+		kcm.logger.Printf("secret %s is missing it's certificate")
+		return nil, nil, errors.New("missing certificate")
+	}
+
+	if secret.Data["key"] == nil {
+		kcm.logger.Printf("secret %s is missing it's private key")
+		return nil, nil, errors.New("missing private key")
+	}
+
 	return secret.Data["cert"], secret.Data["key"], nil
 }
