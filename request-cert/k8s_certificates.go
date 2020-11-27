@@ -17,6 +17,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"time"
@@ -27,6 +28,7 @@ import (
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	types "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	patchTypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	"k8s.io/client-go/tools/clientcmd"
@@ -92,12 +94,12 @@ func getKubernetesCertificate(csrName string, csr []byte, wantServerAuth bool, a
 	}
 
 	fmt.Printf("Sending create request: %s for %s\n", req.Name, *addresses)
-	resp, err := client.Certificates().CertificateSigningRequests().Create(req)
+	resp, err := client.CertificatesV1beta1().CertificateSigningRequests().Create(req)
 
 	if err != nil && k8s_errors.IsAlreadyExists(err) && allowPrevious {
 		fmt.Printf("Attempting to use previous CSR: %s\n", req.Name)
 		getOpts := types.GetOptions{TypeMeta: types.TypeMeta{Kind: "CertificateSigningRequest"}}
-		resp, err = client.Certificates().CertificateSigningRequests().Get(req.Name, getOpts)
+		resp, err = client.CertificatesV1beta1().CertificateSigningRequests().Get(req.Name, getOpts)
 	}
 	if err != nil {
 		return nil, errors.Wrapf(err, "CertificateSigningRequest.Create(%s) failed", req.Name)
@@ -113,7 +115,7 @@ func getKubernetesCertificate(csrName string, csr []byte, wantServerAuth bool, a
 		FieldSelector:  fields.OneTermEqualSelector("metadata.name", csrName).String(),
 	}
 
-	resultCh, err := client.Certificates().CertificateSigningRequests().Watch(watchReq)
+	resultCh, err := client.CertificatesV1beta1().CertificateSigningRequests().Watch(watchReq)
 	if err != nil {
 		return nil, errors.Wrapf(err, "CertificateSigningRequest.Watch(%s) failed: %v", csrName)
 	}
@@ -182,22 +184,38 @@ func storeSecrets(secretName string, cert []byte, key []byte) error {
 	return err
 }
 
-// getSecrets attempts to lookup the certificate and key from the secrets store.
-// A valid response is nil error and non-nil certificate and key.
-func getSecrets(secretName string) ([]byte, []byte, error) {
+func storePkcs12Secrets(secretName string, cert []byte, passPhrase string) error {
 	client, err := getClient()
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
 
-	secret, err := client.Core().Secrets(*namespace).Get(secretName, types.GetOptions{})
+	secret := &core.Secret{
+		Data: map[string][]byte{"pkcs12": cert, "passphrase": []byte(passPhrase)},
+	}
+
+	payloadBytes, _ := json.Marshal(secret)
+
+	_, err = client.CoreV1().Secrets(*namespace).Patch(secretName, patchTypes.StrategicMergePatchType, payloadBytes)
+	return err
+}
+
+// getSecrets attempts to lookup the certificate and key from the secrets store.
+// A valid response is nil error and non-nil certificate and key.
+func getSecrets(secretName string) ([]byte, []byte, []byte, error) {
+	client, err := getClient()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	secret, err := client.CoreV1().Secrets(*namespace).Get(secretName, types.GetOptions{})
 	if err != nil {
 		if k8s_errors.IsNotFound(err) {
-			return nil, nil, nil
+			return nil, nil, nil, nil
 		}
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// We let missing fields return nil.
-	return secret.Data["cert"], secret.Data["key"], nil
+	return secret.Data["cert"], secret.Data["key"], secret.Data["pkcs12"], nil
 }
