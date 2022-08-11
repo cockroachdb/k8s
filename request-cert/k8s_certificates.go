@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+
 	certificates "k8s.io/api/certificates/v1beta1"
 	core "k8s.io/api/core/v1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
@@ -92,12 +93,12 @@ func getKubernetesCertificate(csrName string, csr []byte, wantServerAuth bool, a
 	}
 
 	fmt.Printf("Sending create request: %s for %s\n", req.Name, *addresses)
-	resp, err := client.Certificates().CertificateSigningRequests().Create(req)
+	resp, err := client.CertificatesV1beta1().CertificateSigningRequests().Create(req)
 
 	if err != nil && k8s_errors.IsAlreadyExists(err) && allowPrevious {
 		fmt.Printf("Attempting to use previous CSR: %s\n", req.Name)
 		getOpts := types.GetOptions{TypeMeta: types.TypeMeta{Kind: "CertificateSigningRequest"}}
-		resp, err = client.Certificates().CertificateSigningRequests().Get(req.Name, getOpts)
+		resp, err = client.CertificatesV1beta1().CertificateSigningRequests().Get(req.Name, getOpts)
 	}
 	if err != nil {
 		return nil, errors.Wrapf(err, "CertificateSigningRequest.Create(%s) failed", req.Name)
@@ -113,7 +114,7 @@ func getKubernetesCertificate(csrName string, csr []byte, wantServerAuth bool, a
 		FieldSelector:  fields.OneTermEqualSelector("metadata.name", csrName).String(),
 	}
 
-	resultCh, err := client.Certificates().CertificateSigningRequests().Watch(watchReq)
+	resultCh, err := client.CertificatesV1beta1().CertificateSigningRequests().Watch(watchReq)
 	if err != nil {
 		return nil, errors.Wrapf(err, "CertificateSigningRequest.Watch(%s) failed: %v", csrName)
 	}
@@ -190,7 +191,7 @@ func getSecrets(secretName string) ([]byte, []byte, error) {
 		return nil, nil, err
 	}
 
-	secret, err := client.Core().Secrets(*namespace).Get(secretName, types.GetOptions{})
+	secret, err := client.CoreV1().Secrets(*namespace).Get(secretName, types.GetOptions{})
 	if err != nil {
 		if k8s_errors.IsNotFound(err) {
 			return nil, nil, nil
