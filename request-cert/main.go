@@ -12,7 +12,7 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 //
-// Author: Marc berhault (marc@cockroachlabs.com)
+// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package main
 
@@ -37,22 +37,28 @@ import (
 var (
 	certificateType = flag.String("type", "", "certificate type: node or client")
 
-	addresses = flag.String("addresses", "", "comma-separated list of DNS names and IP addresses for node certificate")
-	user      = flag.String("user", "", "username for client certificate")
+	addresses       = flag.String("addresses", "", "comma-separated list of DNS names and IP addresses for node certificate")
+	user            = flag.String("user", "", "username for client certificate")
 
+	cluster         = flag.String("cluster", "", "logical cluster name distinguishing it from other clusters in the same namespace")
 	namespace       = flag.String("namespace", "", "kubernetes namespace for this pod")
 	certsDir        = flag.String("certs-dir", "cockroach-certs", "certs directory")
-	keySize         = flag.Int("key-size", 2048, "RSA key size in bits")
+	keySize         = flag.Int("key-size", 4096, "RSA key size in bits")
 	symlinkCASource = flag.String("symlink-ca-from", "", "if non-empty, create <certs-dir>/ca.crt linking to this file")
 )
 
 func main() {
 	flag.Parse()
-	flag.Lookup("logtostderr").Value.Set("true")
 
 	// Validate flags.
 	if len(*namespace) == 0 {
 		log.Fatal("--namespace is required and must not be empty")
+	}
+
+	if len(*cluster) > 0 {
+		if strings.Contains(*cluster, " ") {
+			log.Fatal("cluster cannot contain spaces")
+		}
 	}
 
 	// Check certificate type.
@@ -75,7 +81,12 @@ func main() {
 		// Certificate name for nodes must include a node identifier. We use the hostname.
 		// The CSR name is the same.
 		filename = "node"
-		csrName = *namespace + "." + filename + "." + hostname
+		if len(*cluster) == 0 {
+			csrName = *namespace + "." + filename + "." + hostname
+		} else {
+			csrName = *namespace + "." + *cluster + "." + filename + "." + hostname
+		}
+
 		wantServerAuth = true
 	case "client":
 		if len(*user) == 0 {
@@ -86,7 +97,12 @@ func main() {
 		// Certificate name for clients must only include the username.
 		// Include the hostname in the CSR name.
 		filename = "client." + *user
-		csrName = *namespace + "." + filename
+		if len(*cluster) == 0 {
+			csrName = *namespace + "." + filename
+		} else {
+			csrName = *namespace + "." + *cluster + "." + filename
+		}
+
 	default:
 		log.Fatalf("unknown certificate type requested: --type=%q. Valid types are \"node\", \"client\"", *certificateType)
 	}
@@ -168,6 +184,7 @@ func serverCSR(hosts []string) *x509.CertificateRequest {
 		Subject: pkix.Name{
 			Organization: []string{"Cockroach"},
 			CommonName:   "node",
+
 		},
 	}
 
