@@ -10,7 +10,7 @@ at startup, to fill in its [`--locality`](https://www.cockroachlabs.com/docs/sta
 flag value. This allows CockroachDB to be aware of its pods' region and zone
 placements within a Kubernetes deployment.
 
-A complete locality-flag which can be passed into `cockroach start` is written
+A complete locality flag which can be passed into `cockroach start` is written
 to `/etc/cockroach-locality/locality`. For users that want more control of the
 locality flag, the region a pod is running in is written to `/etc/cockroach-locality/region`,
 and the zone is written to `/etc/cockroach-locality/zone`.
